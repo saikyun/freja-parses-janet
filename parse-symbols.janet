@@ -1,18 +1,7 @@
 (import freja/evaling)
 (import freja/state)
 
-(evaling/eval-it state/user-env "(+ 1 1)")
-
-
 (setdyn :pretty-format "%P")
-
-(def code
-  ``````
-(1)
-@[1]
-{:a 1}
-@{}
-``````)
 
 (defn add-start-stop
   [k start content stop]
@@ -27,8 +16,16 @@
 (def token-peg
   ~{:tuple-starts (set "([{")
     :tuple-start '(* (opt "@") :tuple-starts)
-    :tuple-stop '(set ")]}")
-    :symbol '(some (if-not :d (if-not :s 1)))
+    :tuple-stop-set (set ")]}")
+    :tuple-stop ':tuple-stop-set
+    :symfirst (if-not (+ :s
+                         :tuple-stop-set
+                         :d)
+                1)
+    :symrest (if-not (+ :s
+                        :tuple-stop-set)
+               1)
+    :symbol '(* :symfirst (any :symrest))
     :number ':d+
 
     :longstring-delim
@@ -133,7 +130,8 @@
   []
   @{:line 0
     :delimiter-stack @[]
-    :stack @[@[]]})
+    :stack @[@[]]
+    :abs-pos 0})
 
 (comment
   (with-dyns [:parse-state (new-parse-state)]
@@ -157,7 +155,7 @@
     (:tuple-stop ")" 17 18)])
 
 (defn data->obj
-  [line-n kind value start stop]
+  [line-n abs-pos kind value start stop]
   # uncomment this for enlive style
   # (will break examples further down though)
   #{:value value
@@ -165,7 +163,9 @@
   # :start [line-n start]
   # :stop [line-n stop]}
   @[kind @{:start [line-n start]
-           :stop [line-n stop]}
+           :stop [line-n stop]
+           :start-i (+ abs-pos start)
+           :stop-i (+ abs-pos stop)}
     value])
 
 (defn cleanup-longstring
@@ -206,19 +206,23 @@ Then the  is the "root node".
 current line-number
 ```
   [state line]
-  (pp line)
+  #(pp line)
   (def {:delimiter-stack delim-stack
         :stack stack
-        :line line-n} state)
+        :line line-n
+        :abs-pos abs-pos} state)
   (loop [t :in line
          :let [[kind value start stop] t]]
     (case kind
       :tuple-start (do
                      (array/push stack @[])
-                     (array/push delim-stack (data->obj line-n ;t)))
+                     (array/push delim-stack (data->obj line-n abs-pos ;t)))
 
       :tuple-stop
       (let [d (get (last delim-stack) 2)
+            _ (when (nil? d)
+                (errorf "one too many ending delimiters: %P"
+                        (data->obj line-n abs-pos ;t)))
             mut (string/has-prefix? "@" d)]
         (if (= d
                (if mut
@@ -237,16 +241,22 @@ current line-number
                   "@(" :array
                   "@[" :array
                   "@{" :table)
-                @{:start-delim ld
-                  :start (get-in ld [1 :start])
-                  :stop [line-n stop]
-                  :stop-delim (data->obj line-n ;t)}
+                (let [start (get-in ld [1 :start])]
+                  @{:start-delim ld
+                    :start-i (get-in ld [1 :start-i])
+                    :stop-i (+ abs-pos stop)
+                    :start start
+                    :stop [line-n stop]
+                    :stop-delim (data->obj line-n abs-pos ;t)})
                 ;ls]))
-          (error "no match")))
+          (errorf "no match for %p start: %d, stop: %d"
+                  d
+                  start
+                  stop)))
 
       :string-start (do
                       (array/push stack @[])
-                      (array/push delim-stack (data->obj line-n ;t)))
+                      (array/push delim-stack (data->obj line-n abs-pos ;t)))
 
       :string-stop
       (let [d (get (last delim-stack) 2)
@@ -271,36 +281,42 @@ current line-number
             (array/push
               (last stack)
               @[:string
-                @{:start-delim ld
-                  :longstring longstring
-                  :buffer buffer
-                  :start (get-in ld [1 :start])
-                  :stop [line-n stop]
-                  :stop-delim (data->obj line-n ;t)}
+                (let [start (get-in ld [1 :start])]
+                  @{:start-delim ld
+                    :longstring longstring
+                    :buffer buffer
+                    :start-i (+ abs-pos (in start 1))
+                    :stop-i (+ abs-pos stop)
+                    :start start
+                    :stop [line-n stop]
+                    :stop-delim (data->obj line-n abs-pos ;t)})
                 content]))
           (error "no match")))
 
       # else
-      (array/push (last stack) (data->obj line-n ;t)))
+      (array/push (last stack) (data->obj line-n abs-pos ;t)))
 
     (put state :column stop))
 
-  (update state :line inc))
+  (update state :line inc)
+  #(update state :abs-pos + 6(last line) 1)
+  )
 
 (defn code->ast
   [c]
-
-  (def lines
+  (def parsed-lines
     (with-dyns [:parse-state @{}]
       (seq [l :in (string/split "\n" c)]
         #(print "l: " l)
         (->> (peg/match token-peg (string l "\n"))
-             (filter |(not (nil? $)))))))
+             (filter |(not (nil? $)))
+             (|[l $])))))
 
   (def state (new-parse-state))
-
-  (loop [l :in lines]
-    (parse state l))
+  
+  (loop [[l pl] :in parsed-lines]
+    (parse state pl)
+    (update state :abs-pos + (length l) 1))
 
   state)
 
@@ -315,7 +331,8 @@ current line-number
 Just to more easily visualize."
   [hc &keys {:indent indent
              :rowbreak-end rb
-             :show-ws show-ws}]
+             :show-ws show-ws
+             :show-absolute show-i}]
   (default indent 0)
   (default show-ws false)
 
@@ -340,6 +357,10 @@ Just to more easily visualize."
       (prin (string/format ``
 {:start %p :stop %p
 `` (props :start) (props :stop)))
+      (when show-i
+        (prin (string/format ``
+ :start-i %p :stop-i %p
+`` (props :start-i) (props :stop-i))))
       (when (props :buffer)
         (prin " :buffer " (props :buffer)))
       (prin "}")
@@ -354,6 +375,7 @@ Just to more easily visualize."
              :let [h (in children i)]]
         (print-hiccup h
                       :show-ws show-ws
+                      :show-absolute show-i
                       :indent (+ indent 1)
                       # don't rowbreak at end
                       # if final child
@@ -385,13 +407,63 @@ Just to more easily visualize."
         (when (and (<= start-l line)
                    (<= start-c col)
                    (>= stop-l line)
-                   (> stop-c col))
+                   (or (> stop-l line)
+                       (> stop-c col)))
           (unless (nil? pos) # this is the root
             (array/push res pos))
           (unless (empty? children)
             (loop [i :range [0 nof]
                    :let [c (in children i)]]
               (find-tree-index c line col i res)))))
+      res)))
+
+(defn find-node
+  [hc i &opt pos res]
+  (if (string? hc)
+    res
+    (do
+      (def tag (first hc))
+      (def props (hc 1))
+      (def children (drop 2 hc))
+      (def nof (length children))
+
+      (default res @[])
+
+      (let [{:start-i start :stop-i stop} props]
+        (when (and (<= start i)
+                   (< i stop))
+          (unless (nil? pos) # this is the root
+            (array/push res hc))
+          (unless (empty? children)
+            (loop [ci :range [0 nof]
+                   :let [c (in children ci)]]
+              (find-node c i ci res)))))
+      res)))
+
+(defn nodes-between
+  [hc start-line stop-line &opt pos res]
+  (if (string? hc)
+    res
+    (do
+      (def tag (first hc))
+      (def props (hc 1))
+      (def children (drop 2 hc))
+      (def nof (length children))
+
+      (default res @[])
+
+      (let [{:start start :stop stop} props
+            [start-l] start
+            [stop-l] stop]
+        (when (and (<= start-l stop-line)
+                   (>= stop-l start-line))
+          (unless (nil? pos) # this is the root
+            (when (= tag :symbol)
+              (array/push res hc)))
+          (unless (empty? children)
+            (loop [i :range [0 nof]
+                   :let [c (in children i)]]
+              (nodes-between c start-line stop-line i res)))))
       res)))
 
 (defn get-in-hiccup
@@ -442,158 +514,51 @@ that line and column.
     (put-in p [1 :stop] nil)
     (put-in c [1 :stop] nil)))
 
-
-(def res (code->ast code))
-
-(def res
-  (if-not (< 1 (length (res :stack)))
-    res
-    (do
-      (print "incomplete forms: ")
-      (pp res)
-      (print "automatically closing open forms")
-      (loop [[kind _ value] :in (reverse (res :delimiter-stack))]
-        (print "kind: " kind)
-        (match kind
-          :tuple-start
-          (parse res [[:tuple-stop ")" 0 1]])
-
-          :string-start
-          (parse res [[:string-stop value 0 1]])
-
-          (error (string "no automatic closing defined for " kind))))
-      res)))
-
-# extract the ast, slap it into a :root node
-(def hiccup
-  (let [tree (first (res :stack))]
-    @[:root
-      # bogus numbers, should be taken from
-      # first and last children instead
-      {:start [0 0]
-       :stop [;(get-in (last tree) [1 :stop]
-                       # empty tree
-                       [0 0])]}
-      ;tree]))
-
-(print-hiccup hiccup)
-
 (defn in-string?
   [hiccup l c]
   (= :string (first (lc->el hiccup l c))))
 
+(defn close-delims
+  [ast]
+  (if-not (< 1 (length (ast :stack)))
+    ast
+    (do
+      (print "incomplete forms: ")
+      #(pp ast)
+      (printf "%P" ast)
+      (print "automatically closing open forms")
+      (loop [[kind _ value] :in (reverse (ast :delimiter-stack))]
+        (print "kind: " kind)
+        (match kind
+          :tuple-start
+          (parse ast [[:tuple-stop ")" 0 1]])
 
-(defn test1
-  []
+          :string-start
+          (parse ast [[:string-stop value 0 1]])
 
-  (def code
-    ``
-(+ 1 2
-   (+ 3 4)
-   7)
-``)
+          (error (string "no automatic closing defined for " kind))))
+      ast)))
 
-  (def res (code->ast code))
+# extract the ast, slap it into a :root node
+(defn hiccupify
+  [ast]
+  (let [tree (first (ast :stack))]
+    @[:root
+      # bogus numbers, should be taken from
+      # first and last children instead
+      {:start [0 0]
+       :start-i 0
+       :stop [;(get-in (last tree) [1 :stop]
+                       # empty tree
+                       [0 0])]
+       :stop-i (get-in (last tree) [1 :stop-i]
+                       # empty tree
+                       0)}
+      ;tree]))
 
-  # extract the ast, slap it into a :root node
-  (def hiccup
-    (let [tree (first (res :stack))]
-      @[:root
-        # bogus numbers, should be taken from
-        # first and last children instead
-        {:start [0 0]
-         :stop [99999999999 9999999999]}
-        ;tree]))
-
-  (print "full parsed ast")
-  (print (string/format "%P" (res :stack)))
-
-  (print)
-  (print "---------------------------------------------")
-  (print)
-  (print "before popping")
-  (print)
-
-  (print-hiccup
-    hiccup
-    :rowbreak-end true
-    :show-ws true)
-
-  (print)
-
-  (pop-expr hiccup 1 3)
-  # (pop-expr hiccup 1 3)
-
-  (print)
-  (print "after popping")
-
-  (print-hiccup
-    hiccup
-    :rowbreak-end true
-    :show-ws true))
-
-(comment
-  #
-  (test1)
-  #
-)
-
-(comment
-  # old stuff
-  # old expected result, when I thoughtw of using enlive
-  (def expected-result
-    [{:kind :tuple
-      :start [0 0]
-      :stop [1 11]
-      :children
-      [{:kind :symbol
-        :value '+
-        :start [0 1]
-        :stop [0 2]}
-       {:kind :number
-        :value 1
-        :start [0 3]
-        :stop [0 4]}
-       {:kind :number
-        :value 2
-        :start [0 5]
-        :stop [0 6]}
-       {:kind :tuple
-        :start [1 3]
-        :stop [1 10]
-        :children
-        [{:kind :symbol
-          :value '+
-          :start [1 4]
-          :stop [1 5]}
-         {:kind :number
-          :value 3
-          :start [1 6]
-          :stop [1 7]}
-         {:kind :number
-          :value 4
-          :start [1 8]
-          :stop [1 9]}]}]}])
-  #
-  #
-  # prints enlive
-  (defn print-enlive
-    [e &keys {:indent i}]
-    (default i 0)
-    (if (= :tuple (e :kind))
-      (do
-        (prin (string ;(map (fn [_] " ") (range 0 i)))
-              "(")
-        (when (e :children)
-          (let [f (first (e :children))
-                rest (drop 1 (e :children))]
-            (print-enlive f :indent 0)
-            (map |(print-enlive $ :indent (+ i 1)) rest)))
-
-        (prin (string ;(map (fn [_] " ") (range 0 i)))
-              ")"))
-      (do
-        (prin (e :value) " ")
-
-        (when (e :children)
-          (map |(print-enlive $ :indent (+ i 2)) (e :children)))))))
+(defn code->hiccup
+  [code]
+  (-> code
+      code->ast
+      close-delims
+      hiccupify))
